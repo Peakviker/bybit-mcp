@@ -1,0 +1,15 @@
+[Unit]
+Description=Bybit Grid Risk Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/peakviker/bybit-mcp
+ExecStart=/home/peakviker/bybit-mcp/scripts/run_grid_risk_watcher.sh
+Restart=always
+RestartSec=5
+Environment=PATH=/home/peakviker/.bun/bin:/home/peakviker/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
