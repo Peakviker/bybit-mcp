@@ -7,6 +7,7 @@ import { collectGridBotSnapshot } from './grid_snapshot.js';
 import { appendJsonl, ensureRuntimeDir } from './persist.js';
 import { appendFormattedAlerts } from './alert_delivery.js';
 import { runtimePath } from './paths.js';
+import { classifyRuntimeError, defaultGridRiskHealth, statusFromFailures, writeGridRiskHealth, type GridRiskHealth } from './runtime_health.js';
 import { computeRiskDelta } from './risk_delta.js';
 import { computeRiskMetrics, type RiskMetrics } from './risk_metrics.js';
 import { evaluateRiskRules } from './risk_rules.js';
@@ -44,6 +45,9 @@ let previousMetrics: RiskMetrics | null = null;
 let cycleTimer: NodeJS.Timeout | null = null;
 let pendingTopics = new Set<string>();
 let runningCycle = false;
+let health: GridRiskHealth = defaultGridRiskHealth(BOT_ID);
+
+writeGridRiskHealth(health);
 
 function log(line: WatcherStatus): void {
   const json = JSON.stringify(line);
@@ -56,6 +60,13 @@ async function runCycle(reason: string): Promise<void> {
   runningCycle = true;
   const topics = Array.from(pendingTopics);
   pendingTopics.clear();
+  health = {
+    ...health,
+    lastCycleStartedAt: Date.now(),
+    lastReason: reason,
+    lastTopics: topics,
+  };
+  writeGridRiskHealth(health);
 
   try {
     const snapshot = await collectGridBotSnapshot(BOT_ID);
@@ -73,6 +84,20 @@ async function runCycle(reason: string): Promise<void> {
     }
 
     previousMetrics = metrics;
+    const now = Date.now();
+    health = {
+      ...health,
+      lastCycleFinishedAt: now,
+      lastSuccessTs: now,
+      lastSnapshotTs: snapshot.ts,
+      lastAlertTs: alerts.length > 0 ? now : health.lastAlertTs,
+      consecutiveFailures: 0,
+      lastError: null,
+      lastErrorKind: null,
+      lastFormattedAlertPath: formattedPath,
+      runtimeStatus: 'healthy',
+    };
+    writeGridRiskHealth(health);
 
     log({
       kind: 'cycle',
@@ -81,6 +106,7 @@ async function runCycle(reason: string): Promise<void> {
       details: {
         reason,
         topics,
+        runtimeStatus: health.runtimeStatus,
         alertCount: alerts.length,
         severities: alerts.map((alert) => alert.severity),
         codes: alerts.map((alert) => alert.code),
@@ -88,11 +114,28 @@ async function runCycle(reason: string): Promise<void> {
       },
     });
   } catch (error) {
+    const now = Date.now();
+    const consecutiveFailures = health.consecutiveFailures + 1;
+    health = {
+      ...health,
+      lastCycleFinishedAt: now,
+      lastFailureTs: now,
+      consecutiveFailures,
+      lastError: String(error instanceof Error ? error.stack ?? error.message : error),
+      lastErrorKind: classifyRuntimeError(error),
+      runtimeStatus: statusFromFailures(consecutiveFailures),
+    };
+    writeGridRiskHealth(health);
     log({
       kind: 'status',
       ts: Date.now(),
       message: 'risk cycle failed',
-      details: String(error instanceof Error ? error.stack ?? error.message : error),
+      details: {
+        runtimeStatus: health.runtimeStatus,
+        consecutiveFailures: health.consecutiveFailures,
+        errorKind: health.lastErrorKind,
+        error: String(error instanceof Error ? error.stack ?? error.message : error),
+      },
     });
   } finally {
     runningCycle = false;
@@ -130,6 +173,11 @@ emitter.on('response', (event) => {
 emitter.on('update', (event: unknown) => {
   const typedEvent = event as { topic?: string };
   const topic = typeof typedEvent.topic === 'string' ? typedEvent.topic.split('.')[0] : 'unknown';
+  health = {
+    ...health,
+    lastWsEventTs: Date.now(),
+  };
+  writeGridRiskHealth(health);
   log({ kind: 'event', ts: Date.now(), message: 'ws update', details: { topic } });
   scheduleCycle(topic);
 });
